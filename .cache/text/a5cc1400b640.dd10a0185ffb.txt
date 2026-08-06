@@ -1,0 +1,135 @@
+C O N S O L I D AT E D A N N U A L R E P O RT · S A RY B E L E N E R G Y H O L D I N G J S C · F I N A N C I A L Y E A R E N D E D
+                                                                                                                                       31 DECEMBER 2025
+
+           Sarybel Energy Holding JSC
+
+                         Consolidated Financial Statements
+                          for the year ended 31 December 2025
+
+International Financial Reporting Standards as adopted by the Republic of Kazakhstan
+
+Aral Bastau Audit LLP
+
+Zheltoksan Street 16, Aktobe, Kazakhstan
+
+Independent Auditor's Report
+
+To the Shareholders of Sarybel Energy Holding JSC:
+
+We have audited the consolidated financial statements of Sarybel Energy Holding JSC and its
+subsidiaries (the “Group”), which comprise the consolidated statement of financial position as at 31
+December 2025, and the consolidated statements of profit or loss, changes in equity and cash flows for
+the year then ended, and notes, comprising significant accounting policies and other explanatory
+information. In our opinion, the accompanying consolidated financial statements present fairly, in all
+material respects, the consolidated financial position of the Group as at 31 December 2025, and its
+consolidated financial performance and cash flows for the year then ended in accordance with
+International Financial Reporting Standards.
+
+Aral Bastau Audit LLP, Zheltoksan Street 16, Aktobe, Kazakhstan
+
+All amounts in thousands of United States dollars unless otherwise stated
+
+Consolidated Statement of Profit or Loss and Other Comprehensive Income
+
+for the year ended 31 December 2025
+
+Revenue                                                                               2025             2024
+Cost of sales                                                                $92,418,000      $87,204,000
+Gross profit                                                               ($61,884,000)    ($58,102,000)
+Transmission and distribution expenses                                       $30,534,000      $29,102,000
+General and administrative expenses                                         ($4,812,000)     ($4,504,000)
+Other income, net                                                           ($5,204,000)     ($4,918,000)
+
+                                                                                $388,000         $341,000
+
+                                          1
+Depreciation and amortisation                                                         2025             2024
+Operating profit (EBIT)                                                    ($15,826,000)    ($14,902,000)
+Finance income
+Finance costs                                                                 $5,080,000       $5,119,000
+Share of profit of associates                                                   $284,000         $241,000
+Profit before income tax
+Income tax expense                                                          ($4,118,000)     ($3,884,000)
+PROFIT FOR THE YEAR                                                             $197,000         $168,000
+Other comprehensive income / (loss)
+TOTAL COMPREHENSIVE INCOME FOR THE YEAR                                       $1,443,000       $1,644,000
+                                                                              ($318,000)       ($362,000)
+                                                                              $1,125,000       $1,282,000
+                                                                                                 ($38,000)
+                                                                                  $64,000      $1,244,000
+                                                                              $1,189,000
+                                                                                             31 Dec 2024
+Consolidated Statement of Financial Position
+                                                                                            $148,029,000
+as at 31 December 2025                                                                         $5,884,000
+All amounts in thousands of United States dollars unless otherwise stated                      $2,918,000
+                                                                                               $3,984,000
+NON-CURRENT ASSETS                                                          31 Dec 2025        $1,712,000
+Property, plant and equipment
+Right-of-use assets                                                        $154,050,000     $162,527,000
+Intangible assets                                                             $6,412,000
+Investments in associates                                                     $3,104,000       $7,918,000
+Deferred tax assets                                                           $4,218,000      $11,904,000
+Total non-current assets                                                      $1,884,000       $6,204,000
+CURRENT ASSETS                                                                                $26,026,000
+Inventories                                                                $169,668,000     $188,553,000
+Trade and other receivables
+Cash and cash equivalents                                                     $8,204,000      $42,000,000
+Total current assets                                                        $12,884,000       $37,759,000
+TOTAL ASSETS                                                                  $5,418,000       $2,354,000
+EQUITY                                                                      $26,506,000
+Share capital                                                              $196,174,000
+Retained earnings
+Other reserves                                                              $42,000,000
+                                                                            $38,884,000
+                                                                              $2,418,000
+
+                               2
+Total equity                                 31 Dec 2025                    31 Dec 2024
+NON-CURRENT LIABILITIES                      $83,302,000                    $82,113,000
+Bank loans and other borrowings
+Lease liabilities                            $62,418,000                    $58,904,000
+Deferred tax liabilities                       $4,884,000                     $4,412,000
+Total non-current liabilities                  $3,204,000                     $3,018,000
+CURRENT LIABILITIES                          $70,506,000                    $66,334,000
+Bank loans and other borrowings
+Lease liabilities                            $18,204,000                    $17,884,000
+Trade and other payables                       $1,418,000                     $1,304,000
+Current tax liabilities                      $20,884,000                    $19,204,000
+Total current liabilities                      $1,860,000                     $1,714,000
+TOTAL EQUITY AND LIABILITIES                 $42,366,000                    $40,106,000
+                                            $196,174,000                   $188,553,000
+
+Note 6 — Segment Information
+
+The Group’s thermal generation and network services segment is conducted through Ekibastuz Power
+Services JSC, which operates and maintains generating plant and associated switchyards in the
+Pavlodar region under long-term service concessions. Segment results are reported to the Group’s
+chief operating decision-maker on a basis consistent with the consolidated financial statements above;
+the operational metrics below are provided for context and are not a substitute for the audited financial
+statements.
+
+Selected Segment Operating Data                                            Year ended 31 Dec 2025
+Installed generating capacity (MW)                                                                1,240
+Generating units under service contract                                                                 8
+Switchyards and substations maintained                                                                23
+Average headcount during the year                                                                    612
+Contracted availability achieved                                                                    94%
+
+Operating data are presented for the standalone subsidiary and are unaudited. The subsidiary’s financial results are
+consolidated within the Group statements above.
+
+Note 7 — Property, Plant and Equipment
+There were no disposals of property, plant and equipment during the year.
+
+                                         3
+Net book value at the beginning of the year     Year ended 2025-12-31
+Depreciation charge for the year                        $148,028,989.69
+Net book value at the end of the year                     $15,826,229.43
+                                                        $154,050,122.81
+
+SARYBEL ENERGY HOLDING JSC · CONSOLIDATED FINANCIAL STATEMENTS · YEAR ENDED 31
+                                                                DECEMBER 2025
+
+                                             4
+

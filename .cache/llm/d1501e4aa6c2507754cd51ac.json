@@ -1,0 +1,1 @@
+{"is_binding": true, "adjustments": [{"kind": "fx", "reason": "Пересчёт расчётов с Rheinland Katalyse Service GmbH: счёт на 72,146.75 EUR урегулирован платежом на $83,690.23", "amount": 83690.23, "counterparty": "Rheinland Katalyse Service GmbH", "currency": "EUR", "rate_to_usd": 1.16, "to_category": null, "txn_id": null}], "defers_to_report": null}

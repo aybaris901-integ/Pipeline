@@ -1,0 +1,335 @@
+"""Stage 3 — read the documents into machine-checkable structures.
+
+The design principle: the model never does arithmetic and never decides
+COMPLIANT/BREACH. It only translates prose into a small covenant DSL. All
+numbers come from the ledger and all comparisons happen in evaluate.py, so a
+covenant is either parsed correctly or it fails loudly — it can never be
+"nearly right" because the model did mental maths.
+"""
+from __future__ import annotations
+import re
+from .config import CATEGORIES
+
+# --------------------------------------------------------------- schemas ----
+
+COMPONENT = {
+    "type": "object",
+    "properties": {
+        "categories": {"type": "array", "items": {"type": "string", "enum": CATEGORIES},
+                       "description": "Ledger categories summed for this leg (absolute values)."},
+        "related_party_only": {"type": "boolean",
+                               "description": "Restrict to counterparties the KYC dossier marks as related."},
+        "quarter": {"type": ["integer", "null"], "enum": [1, 2, 3, 4, None],
+                    "description": "Restrict to one fiscal quarter, else null."},
+        "largest_line_only": {"type": "boolean",
+                              "description": "Take the largest single category total instead of the sum ('individual line ceiling')."},
+        "include_addbacks": {"type": "boolean",
+                             "description": "Add auditor-approved one-off add-backs (Adjusted EBITDA)."},
+    },
+    "required": ["categories"],
+}
+
+COVENANT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "covenants": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "clause": {"type": "string", "description": "Exactly as printed, e.g. '6.2'."},
+                    "title": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["ratio", "amount"]},
+                    "direction": {"type": "string", "enum": ["max", "min"],
+                                  "description": "'max' = breach when actual exceeds threshold."},
+                    "threshold": {"type": "number", "description": "Positive number; strip $ and the trailing x."},
+                    "numerator": COMPONENT,
+                    "denominator": COMPONENT,
+                    "period_start": {"type": "string"},
+                    "period_end": {"type": "string"},
+                    "springing_condition": {
+                        "type": ["object", "null"],
+                        "description": "Test applies only if this holds; otherwise COMPLIANT regardless.",
+                        "properties": {
+                            "component": COMPONENT,
+                            "operator": {"type": "string", "enum": [">", ">=", "<", "<="]},
+                            "value": {"type": "number"},
+                        },
+                    },
+                    "notes": {"type": "string",
+                              "description": "Any carve-out, cure or reclassification instruction, verbatim."},
+                },
+                "required": ["clause", "kind", "direction", "threshold", "numerator",
+                             "period_start", "period_end"],
+            },
+        }
+    },
+    "required": ["covenants"],
+}
+
+KYC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "account": {"type": "string"},
+        "ownership_threshold_pct": {"type": "number",
+                                    "description": "The percentage at or above which an entity counts as related. Read it from the sentence under the table; it is NOT always 20."},
+        "holdings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string"},
+                    "voting_pct": {"type": "number"},
+                },
+                "required": ["entity", "voting_pct"],
+            },
+        },
+    },
+    "required": ["ownership_threshold_pct", "holdings"],
+}
+
+ADJUSTMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_binding": {"type": "boolean",
+                       "description": "False for interim/draft worksheets that a final report supersedes."},
+        "defers_to_report": {"type": ["string", "null"],
+                             "description": "Report number this document defers its conclusion to, if any."},
+        "adjustments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string",
+                             "enum": ["reclassify", "exclude", "include", "addback", "fx"]},
+                    "txn_id": {"type": ["string", "null"]},
+                    "amount": {"type": ["number", "null"],
+                               "description": "Absolute amount, used to find the line when no txn id is quoted."},
+                    "counterparty": {"type": ["string", "null"]},
+                    "to_category": {"type": ["string", "null"], "enum": CATEGORIES + [None]},
+                    "currency": {"type": ["string", "null"]},
+                    "rate_to_usd": {"type": ["number", "null"],
+                                    "description": "Derived rate when the note gives a foreign invoice and its USD settlement."},
+                    "reason": {"type": "string"},
+                },
+                "required": ["kind", "reason"],
+            },
+        },
+    },
+    "required": ["is_binding", "adjustments"],
+}
+
+TXN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "classifications": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "txn_id": {"type": "string"},
+                    "category": {"type": "string", "enum": CATEGORIES},
+                    "is_filler": {"type": "boolean",
+                                  "description": "True if this row is a filler/separator row rather "
+                                                  "than a genuine transaction (see system prompt)."},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["txn_id", "category", "is_filler"],
+            },
+        }
+    },
+    "required": ["classifications"],
+}
+
+# --------------------------------------------------------------- prompts ----
+
+COVENANT_SYSTEM = """You convert Kazakh/Russian bank loan covenants into a strict machine schema.
+
+Rules you must not break:
+- Copy the clause number exactly as printed ("Пункт 6.2" -> "6.2").
+- `threshold` is a plain positive number: "$1,500,000.00" -> 1500000, "2.00x" -> 2.
+- `direction` is "max" when the borrower must NOT exceed the figure ("не допускать,
+  чтобы ... превышал"), "min" when it must stay at or above it ("не менее", "не ниже").
+- kind="ratio" needs both numerator and denominator. kind="amount" needs numerator only.
+- Map economic concepts onto the fixed category list:
+    Выручка -> revenue
+    Операционные расходы -> opex
+    Капитальные затраты -> capex
+    арендные платежи / лизинг -> lease
+    расходы на оплату труда / персонал -> payroll
+    коммунальные услуги -> utilities
+    Процентные расходы -> interest_expense
+    поступления по финансированию -> financing_inflow
+    налоги -> tax, страхование -> insurance
+  EBITDA = Выручка минус Операционные расходы: numerator {revenue}, denominator {opex}
+  is WRONG. Express EBITDA as numerator categories ["revenue"] with
+  `subtract` handled by the caller — instead, when a leg is "EBITDA", set its
+  categories to ["revenue","opex"] and say EBITDA in `notes`; the evaluator nets
+  inflow categories against expense categories automatically.
+- "Скорректированная EBITDA" additionally sets include_addbacks=true.
+- A test that applies "только при условии, что X превышает Y" is a
+  springing_condition, not part of the ratio.
+- "отдельными статьями ... признаются по отдельности, а не в совокупности" and
+  "по наибольшей из указанных сумм" mean largest_line_only=true.
+- "за четвёртый квартал" sets quarter=4 on that leg.
+- Related-party / аффилированные лица legs set related_party_only=true.
+Return every clause under Статья 6, and only those."""
+
+KYC_SYSTEM = """Extract the related-party test from a KYC dossier.
+
+The ownership cut-off is stated in prose beneath the holdings table and VARIES
+between borrowers (20%, 25%, 40% ...). Read it; never assume. Copy entity names
+exactly, including punctuation such as 'L.L.P.' or quotation marks, because the
+ledger writes the same company slightly differently and the matcher needs the
+original spelling."""
+
+ADJUSTMENT_SYSTEM = """Extract auditor conclusions that change how ledger lines are counted.
+
+Critical precedence rules:
+- An "промежуточная ведомость" / "ПРОЕКТ" / worksheet that says it is replaced by
+  the final agreed-procedures report is NOT binding: set is_binding=false and
+  still list what it claimed, so the caller can prove it was excluded.
+- Notes to the accounts that say the conclusion "изложен в отчёте № AR-xxxx и
+  здесь не повторяется" carry no adjustment themselves: set defers_to_report.
+- A cut-off note ("услуги оказаны в период с 2026-...") is kind="exclude": the
+  line belongs to a different covenant period.
+- A reclassification names the target line item -> kind="reclassify" + to_category.
+- If a note gives a foreign-currency invoice and the USD amount that settled it,
+  emit kind="fx" with rate_to_usd = usd / foreign.
+- Final reports often identify a line by amount and counterparty rather than by
+  txn id. Copy both; leave txn_id null."""
+
+TXN_SYSTEM = """You are classifying corporate bank ledger lines into accounting line items.
+
+Judge by the DESCRIPTION only. Counterparty names in this ledger are randomised
+noise: a payment to "Foxridge Stationery" described as a corporate income tax
+instalment is tax, not stationery.
+
+Category guide:
+- revenue: core trading income, phrased "<activity> sales settlement".
+- opex: core operating/maintenance of the productive asset — "servicing and
+  operating costs", "operating and maintenance expenses", servicing contracts.
+- capex: "Purchase of ... equipment", construction and major repair works.
+- lease: rent and lease of premises, land, yards, masts, vehicles.
+- payroll: wages, bonuses, staff payroll runs.
+- utilities: electricity, water, gas, heating, waste water, metering.
+- interest_expense / interest_income: interest paid / earned.
+- tax, insurance, marketing, telecom, professional_fees (advisory, consulting,
+  management retainers): self-explanatory.
+- financing_inflow: loan or facility drawdowns.
+- credit_refund: money flowing BACK — refunds, rebates, credits, deposits
+  released, overpayments returned, accrual reversals. A positive amount whose
+  description is an expense word is almost always credit_refund, NOT revenue.
+
+Note the sign convention: negative = money out, positive = money in. Classify
+every line you are given, and return exactly one row per txn_id.
+
+Some rows are not real transactions at all: they are FILLER — visual
+separators, section headings, decorative or blank rows, service/boilerplate
+text, or rows that simply describe no economic event. Set is_filler=true for
+those rows and is_filler=false for every genuine transaction line, based on
+the overall content and structure of the row. Do NOT decide filler status by
+checking for one specific character or separator symbol (e.g. a dash) — that
+signal is unreliable and dataset-specific. Instead weigh the row as a whole:
+does it have a plausible amount, a valid date, meaningful non-empty fields,
+and description text long enough to describe an actual economic event? Still
+assign your best-guess category to filler rows as well; every row needs both
+fields."""
+
+
+# ------------------------------------------------------------- extractors ---
+
+def covenant_section(agreement_text: str) -> str:
+    """Slice Статья 6 out of a ~48k character agreement to keep the prompt tight."""
+    flat = agreement_text
+    m = re.search(r"Стать[яи]\s*6\s*[—\-–]\s*Финансовые ковенант", flat)
+    if not m:
+        m = re.search(r"Пункт\s*6\.1", flat)
+    if not m:
+        return flat[:20000]
+    start = m.start()
+    n = re.search(r"Стать[яи]\s*7\s*[—\-–]", flat[start:])
+    end = start + (n.start() if n else 12000)
+    return flat[start:end]
+
+
+def extract_covenants(llm, agreement_text: str) -> list[dict]:
+    body = covenant_section(agreement_text)
+    out = llm.json_call(COVENANT_SYSTEM, body, COVENANT_SCHEMA, name="covenants")
+    return out.get("covenants", [])
+
+
+def extract_kyc(llm, kyc_text: str) -> dict:
+    return llm.json_call(KYC_SYSTEM, kyc_text[:20000], KYC_SCHEMA, name="kyc")
+
+
+def extract_adjustments(llm, doc_text: str) -> dict:
+    return llm.json_call(ADJUSTMENT_SYSTEM, doc_text[:20000], ADJUSTMENT_SCHEMA, name="adjustments")
+
+
+def _normalize_category(v) -> str | None:
+    return v if isinstance(v, str) and v in CATEGORIES else None
+
+
+def _majority_category(votes: list[str]) -> str:
+    counts: dict[str, int] = {}
+    for v in votes:
+        counts[v] = counts.get(v, 0) + 1
+    if not counts:
+        return "other"
+    winner, best = max(counts.items(), key=lambda kv: kv[1])
+    if best * 2 > len(votes):
+        return winner
+    return votes[0]  # no strict majority: keep the first vote, deterministic tie-break
+
+
+def _majority_bool(votes: list[bool]) -> bool:
+    yes = sum(1 for v in votes if v)
+    return yes * 2 > len(votes)
+
+
+def classify_transactions(llm, rows: list[dict], batch: int = 30) -> dict[str, dict]:
+    """Classify a borrower's ledger. Batched to keep each call well inside limits.
+
+    Applies majority voting (AB_VOTES independent calls) to this stage only —
+    the noisy step where the model can disagree with itself.
+    """
+    votes = getattr(llm.cfg, "self_consistency", 1)
+    if votes < 1 or votes % 2 == 0:
+        raise ValueError(f"AB_VOTES must be a positive odd integer, got {votes}")
+
+    result: dict[str, dict] = {}
+    for i in range(0, len(rows), batch):
+        chunk = rows[i:i + batch]
+        lines = "\n".join(
+            f"{r['txn_id']} | {r['date']} | {float(r['amount']):.2f} {r['currency']} | "
+            f"{r['counterparty']} | {r['description']}"
+            for r in chunk
+        )
+
+        ballots: list[dict[str, dict]] = []
+        for v in range(votes):
+            pass_user = lines if votes == 1 else f"{lines}\n\n[self-consistency pass {v + 1}/{votes}]"
+            out = llm.json_call(TXN_SYSTEM, pass_user, TXN_SCHEMA, name="classify")
+            ballot: dict[str, dict] = {}
+            for c in out.get("classifications", []):
+                tid = c.get("txn_id")
+                if not isinstance(tid, str):
+                    continue
+                ballot[tid] = {
+                    "category": _normalize_category(c.get("category")) or "other",
+                    "is_filler": bool(c.get("is_filler", False)),
+                }
+            ballots.append(ballot)
+
+        for r in chunk:
+            tid = r["txn_id"]
+            cat_votes = [b[tid]["category"] for b in ballots if tid in b]
+            filler_votes = [b[tid]["is_filler"] for b in ballots if tid in b]
+            category = _majority_category(cat_votes) if cat_votes else "other"
+            is_filler = _majority_bool(filler_votes) if filler_votes else False
+            if votes > 1:
+                print(f"VOTE txn={tid} categories={cat_votes} filler={filler_votes} "
+                      f"winner={category} filler={is_filler}")
+            result[tid] = {"category": category, "is_filler": is_filler}
+    return result
