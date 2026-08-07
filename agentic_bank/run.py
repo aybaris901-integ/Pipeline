@@ -217,6 +217,15 @@ def main():
         llm = LLM(cfg, paths.llm_cache)
 
     texts = ingest_all(paths.documents, paths.text_cache, llm, args.vision_cache)
+
+    if llm is not None and os.environ.get("AB_BYPASS_VISION_CACHE") == "1":
+        expected = 4
+        if llm.vision_calls != expected:
+            raise SystemExit(
+                f"AB_BYPASS_VISION_CACHE=1 verification failed: expected exactly "
+                f"{expected} real VISION_API_CALL requests, got {llm.vision_calls}."
+            )
+
     by_scenario, acc_to_scenario = load_ledger(paths.ledger)
     docs = build_index(texts, acc_to_scenario)
 

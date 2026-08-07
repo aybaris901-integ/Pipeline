@@ -7,8 +7,10 @@ covenant is either parsed correctly or it fails loudly — it can never be
 "nearly right" because the model did mental maths.
 """
 from __future__ import annotations
+import os
 import re
 from .config import CATEGORIES
+from .llm import LLMError
 
 # --------------------------------------------------------------- schemas ----
 
@@ -122,23 +124,23 @@ ADJUSTMENT_SCHEMA = {
 TXN_SCHEMA = {
     "type": "object",
     "properties": {
-        "classifications": {
+        "transactions": {
             "type": "array",
+            "description": "Exactly one entry per input row, same order as the input, no omissions.",
             "items": {
                 "type": "object",
                 "properties": {
-                    "txn_id": {"type": "string"},
+                    "id": {"type": "string", "description": "The txn_id, copied exactly as given."},
                     "category": {"type": "string", "enum": CATEGORIES},
-                    "is_filler": {"type": "boolean",
-                                  "description": "True if this row is a filler/separator row rather "
-                                                  "than a genuine transaction (see system prompt)."},
-                    "confidence": {"type": "number"},
+                    "filler": {"type": "boolean",
+                               "description": "True if this row is a filler/separator row rather "
+                                               "than a genuine transaction (see system prompt)."},
                 },
-                "required": ["txn_id", "category", "is_filler"],
+                "required": ["id", "category", "filler"],
             },
         }
     },
-    "required": ["classifications"],
+    "required": ["transactions"],
 }
 
 # --------------------------------------------------------------- prompts ----
@@ -222,12 +224,14 @@ Category guide:
   description is an expense word is almost always credit_refund, NOT revenue.
 
 Note the sign convention: negative = money out, positive = money in. Classify
-every line you are given, and return exactly one row per txn_id.
+every line you are given, and return exactly one entry per input row, using
+its id exactly as given — never omit a row, invent one, or merge two rows
+into one entry.
 
 Some rows are not real transactions at all: they are FILLER — visual
 separators, section headings, decorative or blank rows, service/boilerplate
-text, or rows that simply describe no economic event. Set is_filler=true for
-those rows and is_filler=false for every genuine transaction line, based on
+text, or rows that simply describe no economic event. Set filler=true for
+those rows and filler=false for every genuine transaction line, based on
 the overall content and structure of the row. Do NOT decide filler status by
 checking for one specific character or separator symbol (e.g. a dash) — that
 signal is unreliable and dataset-specific. Instead weigh the row as a whole:
@@ -267,16 +271,63 @@ def extract_adjustments(llm, doc_text: str) -> dict:
     return llm.json_call(ADJUSTMENT_SYSTEM, doc_text[:20000], ADJUSTMENT_SCHEMA, name="adjustments")
 
 
-def _normalize_category(v) -> str | None:
-    return v if isinstance(v, str) and v in CATEGORIES else None
+DEFAULT_BATCH_SIZE = 50
+
+
+def _batch_size() -> int:
+    n = int(os.environ.get("AB_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+    if n < 1:
+        raise ValueError(f"AB_BATCH_SIZE must be a positive integer, got {n}")
+    return n
+
+
+def _vote_count(llm) -> int:
+    votes = getattr(llm.cfg, "self_consistency", 1)
+    if votes < 1 or votes % 2 == 0:
+        raise ValueError(f"AB_VOTES must be a positive odd integer, got {votes}")
+    return votes
+
+
+def _validate_ballot(out: dict, expected_ids: set) -> dict[str, dict]:
+    """Validate one batched classifier response against the input row ids.
+
+    Every input id must appear exactly once, with a valid category and a
+    boolean filler flag. Unknown ids, duplicates, bad categories/types, or
+    missing rows are all treated as a broken response — raise rather than
+    silently patch it, since a partial ballot would corrupt the vote.
+    """
+    items = out.get("transactions")
+    if not isinstance(items, list):
+        raise LLMError("classifier response is missing a 'transactions' array")
+
+    seen: dict[str, dict] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise LLMError(f"classifier response contains a non-object transaction entry: {item!r}")
+        tid = item.get("id")
+        if not isinstance(tid, str) or tid not in expected_ids:
+            raise LLMError(f"classifier response contains an unknown transaction id: {tid!r}")
+        if tid in seen:
+            raise LLMError(f"classifier response contains a duplicate transaction id: {tid!r}")
+        category = item.get("category")
+        if category not in CATEGORIES:
+            raise LLMError(f"classifier returned an invalid category {category!r} for {tid}")
+        filler = item.get("filler")
+        if not isinstance(filler, bool):
+            raise LLMError(f"classifier returned a non-boolean 'filler' for {tid}: {filler!r}")
+        seen[tid] = {"category": category, "is_filler": filler}
+
+    missing = expected_ids - seen.keys()
+    if missing:
+        raise LLMError(f"classifier response is missing {len(missing)} transaction id(s): "
+                        f"{sorted(missing)[:10]}")
+    return seen
 
 
 def _majority_category(votes: list[str]) -> str:
     counts: dict[str, int] = {}
     for v in votes:
         counts[v] = counts.get(v, 0) + 1
-    if not counts:
-        return "other"
     winner, best = max(counts.items(), key=lambda kv: kv[1])
     if best * 2 > len(votes):
         return winner
@@ -288,19 +339,22 @@ def _majority_bool(votes: list[bool]) -> bool:
     return yes * 2 > len(votes)
 
 
-def classify_transactions(llm, rows: list[dict], batch: int = 30) -> dict[str, dict]:
-    """Classify a borrower's ledger. Batched to keep each call well inside limits.
+def classify_transactions(llm, rows: list[dict], batch: int | None = None) -> dict[str, dict]:
+    """Classify a borrower's ledger with one batched call per chunk of rows.
 
-    Applies majority voting (AB_VOTES independent calls) to this stage only —
-    the noisy step where the model can disagree with itself.
+    One call classifies up to AB_BATCH_SIZE (default 50) rows at once — a
+    whole scenario's ledger fits in a single call whenever it's that small.
+    Majority voting (AB_VOTES independent calls) is applied per batch, not
+    per transaction: each vote classifies the whole chunk in one call, and
+    the majority is then taken independently for every transaction id.
     """
-    votes = getattr(llm.cfg, "self_consistency", 1)
-    if votes < 1 or votes % 2 == 0:
-        raise ValueError(f"AB_VOTES must be a positive odd integer, got {votes}")
+    votes = _vote_count(llm)
+    batch_size = batch or _batch_size()
 
     result: dict[str, dict] = {}
-    for i in range(0, len(rows), batch):
-        chunk = rows[i:i + batch]
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        expected_ids = {r["txn_id"] for r in chunk}
         lines = "\n".join(
             f"{r['txn_id']} | {r['date']} | {float(r['amount']):.2f} {r['currency']} | "
             f"{r['counterparty']} | {r['description']}"
@@ -311,23 +365,13 @@ def classify_transactions(llm, rows: list[dict], batch: int = 30) -> dict[str, d
         for v in range(votes):
             pass_user = lines if votes == 1 else f"{lines}\n\n[self-consistency pass {v + 1}/{votes}]"
             out = llm.json_call(TXN_SYSTEM, pass_user, TXN_SCHEMA, name="classify")
-            ballot: dict[str, dict] = {}
-            for c in out.get("classifications", []):
-                tid = c.get("txn_id")
-                if not isinstance(tid, str):
-                    continue
-                ballot[tid] = {
-                    "category": _normalize_category(c.get("category")) or "other",
-                    "is_filler": bool(c.get("is_filler", False)),
-                }
-            ballots.append(ballot)
+            ballots.append(_validate_ballot(out, expected_ids))
 
-        for r in chunk:
-            tid = r["txn_id"]
-            cat_votes = [b[tid]["category"] for b in ballots if tid in b]
-            filler_votes = [b[tid]["is_filler"] for b in ballots if tid in b]
-            category = _majority_category(cat_votes) if cat_votes else "other"
-            is_filler = _majority_bool(filler_votes) if filler_votes else False
+        for tid in expected_ids:
+            cat_votes = [b[tid]["category"] for b in ballots]
+            filler_votes = [b[tid]["is_filler"] for b in ballots]
+            category = _majority_category(cat_votes)
+            is_filler = _majority_bool(filler_votes)
             if votes > 1:
                 print(f"VOTE txn={tid} categories={cat_votes} filler={filler_votes} "
                       f"winner={category} filler={is_filler}")

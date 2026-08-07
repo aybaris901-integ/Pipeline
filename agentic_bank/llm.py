@@ -69,6 +69,7 @@ class LLM:
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.calls = 0
+        self.vision_calls = 0  # real (non-cached) vision API calls this run
 
     # ------------------------------------------------------------ plumbing --
     def _post(self, payload: dict) -> dict:
@@ -88,6 +89,15 @@ class LLM:
                     return json.loads(r.read())
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", "replace")
+                if e.code == 429 and _is_daily_quota_error(body):
+                    # A daily quota won't recover within a retry backoff window —
+                    # hammering it just burns more of tomorrow's calls too.
+                    raise LLMError(
+                        "Gemini daily free-tier quota exhausted (HTTP 429, RESOURCE_EXHAUSTED, "
+                        "a *PerDay* limit). Retrying will not help: wait for the quota to reset "
+                        "(daily) or enable billing on the project to raise the limit. "
+                        f"Details: {_safe_excerpt(body)}"
+                    ) from None
                 if e.code in (429, 500, 502, 503, 504) and attempt < self.cfg.max_retries - 1:
                     time.sleep(delay)
                     delay *= 2
@@ -101,12 +111,45 @@ class LLM:
                 raise LLMError("Gemini API request failed: network error") from None
         raise LLMError("exhausted retries")
 
-    def _cached(self, key: dict, fn):
-        full_key = {**key, "provider": self.cfg.provider, "m": self.cfg.model}
-        h = hashlib.sha256(json.dumps(full_key, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
-        path = os.path.join(self.cache_dir, h + ".json")
-        if os.path.exists(path):
-            return json.load(open(path, encoding="utf-8"))
+    def _hash(self, key: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(key, sort_keys=True, ensure_ascii=False, default=str).encode()
+        ).hexdigest()[:24]
+
+    def _cached(self, key: dict, fn, bypass_read: bool = False, on_hit=None):
+        """Cache by a key that pins provider/model/base_url plus the call's own
+        content (system+user+schema+name, or prompt+image). A prior build of
+        this client hashed a narrower key (no base_url, no call name); we look
+        there too and migrate a hit forward, so a cache already paid for in API
+        calls doesn't go to waste just because the key got stricter.
+
+        `bypass_read`, used only by vision() under AB_BYPASS_VISION_CACHE,
+        skips the read-side lookup (both current and legacy) so the real API
+        is always called, while still writing the result to the normal cache
+        path afterwards — json_call never sets this, so its caching (and the
+        transaction classifier's, which is built on json_call) is untouched.
+        """
+        full_key = {"provider": self.cfg.provider, "model": self.cfg.model,
+                     "base_url": self.cfg.base_url, **key}
+        path = os.path.join(self.cache_dir, self._hash(full_key) + ".json")
+
+        if not bypass_read:
+            if os.path.exists(path):
+                val = json.load(open(path, encoding="utf-8"))
+                if on_hit:
+                    on_hit()
+                return val
+
+            legacy_key = _legacy_cache_key(self.cfg, key)
+            if legacy_key is not None:
+                legacy_path = os.path.join(self.cache_dir, self._hash(legacy_key) + ".json")
+                if os.path.exists(legacy_path):
+                    val = json.load(open(legacy_path, encoding="utf-8"))
+                    json.dump(val, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+                    if on_hit:
+                        on_hit()
+                    return val
+
         val = fn()
         json.dump(val, open(path, "w", encoding="utf-8"), ensure_ascii=False)
         return val
@@ -152,15 +195,19 @@ class LLM:
                 raise LLMError(f"Gemini returned a JSON {type(parsed).__name__}, expected an object")
             return parsed
 
-        return self._cached({"s": system, "u": user, "sc": schema}, run)
+        return self._cached({"system": system, "user": user, "schema": schema, "name": name}, run)
 
     def vision(self, prompt: str, image_path: str) -> str:
         media = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
         b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+        bypass = os.environ.get("AB_BYPASS_VISION_CACHE") == "1"
 
         def run():
+            # Must print immediately before the real HTTP request, and only
+            # here — never on a cache-hit path.
             print(f"VISION_API_CALL file={image_path}")
             self.calls += 1
+            self.vision_calls += 1
             payload = {
                 "contents": [{"role": "user", "parts": [
                     {"inlineData": {"mimeType": media, "data": b64}},
@@ -174,8 +221,31 @@ class LLM:
             data = self._post(payload)
             return self._extract_text(data)
 
+        def on_hit():
+            print(f"VISION_CACHE_HIT file={image_path}")
+
         return self._cached(
-            {"p": prompt, "img": hashlib.md5(b64.encode()).hexdigest()}, run)
+            {"prompt": prompt, "image": hashlib.md5(b64.encode()).hexdigest()},
+            run, bypass_read=bypass, on_hit=on_hit)
+
+
+def _legacy_cache_key(cfg: LLMConfig, key: dict) -> dict | None:
+    """Reconstruct the pre-fix cache key shape for one call, if it matches
+    a known shape, so already-cached entries stay reachable. Returns None for
+    key shapes that didn't exist under the old format (e.g. the transaction
+    classifier's wire format changed, so there is nothing valid to recover)."""
+    if {"system", "user", "schema", "name"} <= key.keys():
+        return {"s": key["system"], "u": key["user"], "sc": key["schema"],
+                "provider": cfg.provider, "m": cfg.model}
+    if {"prompt", "image"} <= key.keys():
+        return {"p": key["prompt"], "img": key["image"],
+                "provider": cfg.provider, "m": cfg.model}
+    return None
+
+
+def _is_daily_quota_error(body: str) -> bool:
+    low = body.lower().replace(" ", "")
+    return "resource_exhausted" in low and "perday" in low
 
 
 def _safe_excerpt(body: str, limit: int = 400) -> str:
