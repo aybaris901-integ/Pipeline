@@ -56,12 +56,21 @@ def validate_submission(sub: dict, template: dict) -> None:
                 raise SubmissionError(f"cell {sid}/{clause} has invalid status {status!r}")
 
             actual = cell["actual"]
-            if isinstance(actual, bool) or not isinstance(actual, (int, float)):
-                raise SubmissionError(f"cell {sid}/{clause} 'actual' must be a number, got {actual!r}")
-            if not math.isfinite(actual):
-                raise SubmissionError(f"cell {sid}/{clause} 'actual' must be finite, got {actual!r}")
-            if actual <= 0:
-                raise SubmissionError(f"cell {sid}/{clause} 'actual' must be greater than zero, got {actual!r}")
+            # None is a legitimate 'actual': evaluate.metric() already
+            # reports it that way when there's nothing meaningful to
+            # measure (e.g. a ratio's denominator is zero, or the
+            # measured quantity works out to a bare zero — see
+            # evaluate.final_actual). It is a distinct case from a real,
+            # reportable measurement, which must still be a positive number.
+            if actual is not None:
+                if isinstance(actual, bool) or not isinstance(actual, (int, float)):
+                    raise SubmissionError(
+                        f"cell {sid}/{clause} 'actual' must be a number or null, got {actual!r}")
+                if not math.isfinite(actual):
+                    raise SubmissionError(f"cell {sid}/{clause} 'actual' must be finite, got {actual!r}")
+                if actual <= 0:
+                    raise SubmissionError(
+                        f"cell {sid}/{clause} 'actual' must be greater than zero, got {actual!r}")
 
             ev = cell["evidence_txn_id"]
             if ev is not None and not isinstance(ev, str):

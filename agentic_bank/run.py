@@ -10,7 +10,7 @@ from collections import defaultdict
 
 from . import covenant_rules, extract, rules
 from .config import LLMConfig, Paths, Submission
-from .evaluate import Context, Txn, find_evidence, round2, verdict
+from .evaluate import Context, Txn, final_actual, find_evidence, verdict
 from .ingest import ingest_all
 from .route import build_index, select_sources
 from .extract import covenant_section
@@ -189,7 +189,7 @@ def solve_scenario(scenario, rows, docs, backend, llm=None, verbose=False):
     for spec in specs:
         status, value = verdict(ctx, spec)
         ev = find_evidence(ctx, spec, status, touched)
-        answers[spec["clause"]] = {"status": status, "actual": round2(value),
+        answers[spec["clause"]] = {"status": status, "actual": final_actual(value),
                                    "evidence_txn_id": ev}
         if verbose:
             print(f"  {scenario} {spec['clause']:4} {status:9} {value!r:>16} ev={ev}")
@@ -246,7 +246,7 @@ def main():
         answers, _, _ = solve_scenario(scenario, by_scenario.get(scenario, []), docs,
                                        args.backend, llm, args.verbose)
         out["answers"][scenario] = {
-            clause: answers.get(clause, {"status": "COMPLIANT", "actual": 0.0,
+            clause: answers.get(clause, {"status": "COMPLIANT", "actual": None,
                                          "evidence_txn_id": None})
             for clause in cells
         }

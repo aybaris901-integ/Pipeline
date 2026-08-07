@@ -1,0 +1,1 @@
+{"is_binding": false, "defers_to_report": null, "adjustments": [{"kind": "include", "txn_id": "TXN-P7-0033", "amount": 486204.19, "counterparty": "State Revenue Committee", "to_category": "tax", "currency": "USD", "rate_to_usd": null, "reason": "Position not loaded into accounting export; actual amount $486,204.19 expense."}]}

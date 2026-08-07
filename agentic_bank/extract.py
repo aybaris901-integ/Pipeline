@@ -152,7 +152,9 @@ Rules you must not break:
 - `threshold` is a plain positive number: "$1,500,000.00" -> 1500000, "2.00x" -> 2.
 - `direction` is "max" when the borrower must NOT exceed the figure ("не допускать,
   чтобы ... превышал"), "min" when it must stay at or above it ("не менее", "не ниже").
-- kind="ratio" needs both numerator and denominator. kind="amount" needs numerator only.
+- kind="ratio" needs both numerator and denominator. kind="amount" needs numerator only —
+  set denominator to null for an amount covenant (never invent one).
+- If there is nothing to say, set `notes` to null rather than an empty explanation.
 - Map economic concepts onto the fixed category list:
     Выручка -> revenue
     Операционные расходы -> opex
@@ -257,18 +259,40 @@ def covenant_section(agreement_text: str) -> str:
     return flat[start:end]
 
 
+def _covenant_semantic_errors(parsed: dict) -> list[str]:
+    """Business-rule check the generic JSON-Schema subset can't express:
+    `denominator` is only genuinely optional for kind="amount" (evaluate.metric()
+    never reads it there). A kind="ratio" covenant divides by it, so null/absent
+    is never a valid representation for one — unlike `notes`, which no code
+    anywhere reads, or an amount covenant's denominator, which is inert."""
+    errors = []
+    for i, c in enumerate(parsed.get("covenants") or []):
+        if c.get("kind") == "ratio" and c.get("denominator") is None:
+            errors.append(f"$.covenants[{i}].denominator: null on a kind=\"ratio\" covenant "
+                           f"(a ratio needs a real denominator; only kind=\"amount\" may omit it)")
+    return errors
+
+
 def extract_covenants(llm, agreement_text: str) -> list[dict]:
     body = covenant_section(agreement_text)
-    out = llm.json_call(COVENANT_SYSTEM, body, COVENANT_SCHEMA, name="covenants")
+    # 2048: each clause nests numerator/denominator/springing_condition
+    # objects plus a free-text `notes` field, and Статья 6 typically holds
+    # several clauses — the small 1024 budget is genuinely tight here.
+    out = llm.json_call(COVENANT_SYSTEM, body, COVENANT_SCHEMA, name="covenants", max_tokens=2048,
+                         extra_validate=_covenant_semantic_errors)
     return out.get("covenants", [])
 
 
 def extract_kyc(llm, kyc_text: str) -> dict:
-    return llm.json_call(KYC_SYSTEM, kyc_text[:20000], KYC_SCHEMA, name="kyc")
+    # 1024: a threshold percentage plus a short holdings list — small output.
+    return llm.json_call(KYC_SYSTEM, kyc_text[:20000], KYC_SCHEMA, name="kyc", max_tokens=1024)
 
 
 def extract_adjustments(llm, doc_text: str) -> dict:
-    return llm.json_call(ADJUSTMENT_SYSTEM, doc_text[:20000], ADJUSTMENT_SCHEMA, name="adjustments")
+    # 1024: a handful of adjustments per document, each a few short fields
+    # plus a one-line `reason`.
+    return llm.json_call(ADJUSTMENT_SYSTEM, doc_text[:20000], ADJUSTMENT_SCHEMA, name="adjustments",
+                          max_tokens=1024)
 
 
 DEFAULT_BATCH_SIZE = 50
@@ -339,6 +363,22 @@ def _majority_bool(votes: list[bool]) -> bool:
     return yes * 2 > len(votes)
 
 
+def _amt(v) -> float:
+    """The ledger ships a handful of rows with an EMPTY amount — not
+    corrupt data: the real figure is disclosed in a treasury memo or
+    auditor note and patched onto the transaction later via a `set_amount`
+    adjustment in run.build_context() (see the identical contract in
+    rules._amt / run._ledger_amount). The row itself is real and must still
+    be classified and kept, never dropped, so 0.0 is a safe placeholder
+    here — it only steers the classifier's own sign-based heuristics
+    (`expense description + positive amount => credit_refund`), it is
+    never used as the covenant-arithmetic value."""
+    try:
+        return float(str(v).strip())
+    except ValueError:
+        return 0.0
+
+
 def classify_transactions(llm, rows: list[dict], batch: int | None = None) -> dict[str, dict]:
     """Classify a borrower's ledger with one batched call per chunk of rows.
 
@@ -356,7 +396,7 @@ def classify_transactions(llm, rows: list[dict], batch: int | None = None) -> di
         chunk = rows[i:i + batch_size]
         expected_ids = {r["txn_id"] for r in chunk}
         lines = "\n".join(
-            f"{r['txn_id']} | {r['date']} | {float(r['amount']):.2f} {r['currency']} | "
+            f"{r['txn_id']} | {r['date']} | {_amt(r['amount']):.2f} {r['currency']} | "
             f"{r['counterparty']} | {r['description']}"
             for r in chunk
         )
@@ -364,7 +404,10 @@ def classify_transactions(llm, rows: list[dict], batch: int | None = None) -> di
         ballots: list[dict[str, dict]] = []
         for v in range(votes):
             pass_user = lines if votes == 1 else f"{lines}\n\n[self-consistency pass {v + 1}/{votes}]"
-            out = llm.json_call(TXN_SYSTEM, pass_user, TXN_SCHEMA, name="classify")
+            # 2048: one {id, category, filler} entry per row, up to
+            # AB_BATCH_SIZE (default 50) rows in a single response — 1024
+            # would be tight at the default batch size.
+            out = llm.json_call(TXN_SYSTEM, pass_user, TXN_SCHEMA, name="classify", max_tokens=2048)
             ballots.append(_validate_ballot(out, expected_ids))
 
         for tid in expected_ids:

@@ -37,10 +37,25 @@ class LLMAuthError(LLMError):
     """Invalid/missing credentials. Never triggers a model fallback."""
 
 
+class LLMProviderBlockedError(LLMError):
+    """The provider's edge/CDN rejected the request before it reached the
+    model (e.g. a Cloudflare anti-bot rule) — not an invalid API key. Never
+    triggers a model fallback: retrying with a different model changes
+    nothing about the edge block."""
+
+
 class LLMRequestError(LLMError):
     """The request itself was rejected (bad model name, malformed payload,
     schema the API won't accept). Points at a bug/misconfiguration, not a
     model capability gap — never triggers a model fallback."""
+
+
+class LLMPromptTooLargeError(LLMRequestError):
+    """The prompt's input tokens alone are too close to (or over) the
+    model's per-minute token budget, even with an already-minimal completion
+    allowance — a payload-size problem, not a transient rate limit. Waiting
+    and retrying the same request will not help; the input itself (e.g. a
+    batch or document slice) needs to shrink."""
 
 
 class LLMValidationError(LLMError):
@@ -178,11 +193,22 @@ def _validate_json_schema(value, schema, path: str = "$", errors: list | None = 
 
     if isinstance(value, dict):
         props = schema.get("properties") or {}
-        for req in schema.get("required", []):
+        required = set(schema.get("required", []))
+        for req in required:
             if req not in value:
                 errors.append(f"{path}: missing required property {req!r}")
         for k, v in value.items():
             if k in props:
+                if v is None and k not in required:
+                    # An optional property explicitly set to null is exactly
+                    # what _to_strict_openai_schema's wire-format conversion
+                    # asks strict-mode models for in place of omitting the
+                    # key outright (OpenAI/Groq strict mode can't actually
+                    # drop a key) — json_object-mode models converge on the
+                    # same null-for-"not applicable" convention unprompted.
+                    # Treat it as the omission it represents rather than
+                    # validating None against the property's real type.
+                    continue
                 _validate_json_schema(v, props[k], f"{path}.{k}", errors)
 
     if isinstance(value, list):
@@ -268,11 +294,30 @@ class LLM:
         return val
 
     # --------------------------------------------------------------- public --
-    def json_call(self, system: str, user: str, schema: dict, name: str = "emit") -> dict:
-        """Return a dict validated against `schema`."""
+    def json_call(self, system: str, user: str, schema: dict, name: str = "emit",
+                  max_tokens: int | None = None, extra_validate=None) -> dict:
+        """Return a dict validated against `schema`.
+
+        `max_tokens` lets the caller reserve only as much completion budget
+        as its schema genuinely needs (defaults to `cfg.max_tokens` when
+        omitted) — Groq's free-tier TPM limit counts reserved/requested
+        output tokens against the same per-minute budget as the prompt, so a
+        generic large default starves small calls of headroom for no
+        benefit.
+
+        `extra_validate`, if given, is called as `extra_validate(parsed)`
+        after generic schema validation passes and must return a list of
+        error strings (empty = OK). It exists for business-rule checks the
+        generic JSON-Schema subset can't express — e.g. a field that's only
+        *conditionally* required depending on a sibling value — without
+        baking that domain knowledge into the schema validator itself. A
+        failure here escalates to the next model in the chain exactly like a
+        generic schema-validation failure (Groq only; Gemini's responseSchema
+        is trusted as-is, unchanged).
+        """
         if self.cfg.provider == "gemini":
-            return self._json_call_gemini(system, user, schema, name)
-        return self._json_call_groq(system, user, schema, name)
+            return self._json_call_gemini(system, user, schema, name, max_tokens)
+        return self._json_call_groq(system, user, schema, name, max_tokens, extra_validate)
 
     def vision(self, prompt: str, image_path: str) -> str:
         if self.cfg.vision_provider == "gemini":
@@ -292,13 +337,15 @@ class LLM:
                                    "LLM_STRONG_FALLBACK_MODEL are all empty)")
         return chain
 
-    def _json_call_groq(self, system: str, user: str, schema: dict, name: str) -> dict:
+    def _json_call_groq(self, system: str, user: str, schema: dict, name: str,
+                         max_tokens: int | None = None, extra_validate=None) -> dict:
         last_err: Exception | None = None
         for model in self._chain():
             try:
                 return self._cached(
                     {"system": system, "user": user, "schema": schema, "name": name, "model": model},
-                    lambda m=model: self._call_groq_model(m, system, user, schema, name),
+                    lambda m=model: self._call_groq_model(m, system, user, schema, name, max_tokens,
+                                                           extra_validate),
                 )
             except (LLMValidationError, LLMTransientError) as e:
                 last_err = e
@@ -307,7 +354,8 @@ class LLM:
                 continue
         raise LLMError(f"all configured Groq models failed for '{name}': {last_err}") from last_err
 
-    def _call_groq_model(self, model: str, system: str, user: str, schema: dict, name: str) -> dict:
+    def _call_groq_model(self, model: str, system: str, user: str, schema: dict, name: str,
+                          max_tokens: int | None = None, extra_validate=None) -> dict:
         self.calls += 1
         sys_prompt = system + _schema_instructions(schema, name)
         messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user}]
@@ -317,14 +365,18 @@ class LLM:
                 text = self._chat_groq(model, messages, {
                     "type": "json_schema",
                     "json_schema": {"name": name, "schema": _to_strict_openai_schema(schema), "strict": True},
-                })
-            except LLMRequestError:
+                }, max_tokens=max_tokens)
+            except LLMRequestError as e:
                 # This model/deployment didn't accept our schema in strict
                 # mode — same model, just fall back to plain JSON mode
-                # rather than treating it as a hard config error.
-                text = self._chat_groq(model, messages, {"type": "json_object"})
+                # rather than treating it as a hard config error. Logged
+                # (not silent) so a live run can confirm whether a given
+                # call actually got strict Structured Outputs or degraded.
+                if self.cfg.verbose:
+                    print(f"LLM_STRUCTURED_OUTPUT_DEGRADE model={model} name={name} reason={e}")
+                text = self._chat_groq(model, messages, {"type": "json_object"}, max_tokens=max_tokens)
         else:
-            text = self._chat_groq(model, messages, {"type": "json_object"})
+            text = self._chat_groq(model, messages, {"type": "json_object"}, max_tokens=max_tokens)
 
         try:
             parsed = json.loads(text)
@@ -335,6 +387,8 @@ class LLM:
                 f"{model} returned a JSON {type(parsed).__name__}, expected an object")
 
         errors = _validate_json_schema(parsed, schema)
+        if not errors and extra_validate is not None:
+            errors = list(extra_validate(parsed))
         if errors:
             raise LLMValidationError(f"{model} response failed schema validation: {errors[:5]}")
 
@@ -343,15 +397,17 @@ class LLM:
         return parsed
 
     def _chat_groq(self, model: str, messages: list, response_format: dict | None,
-                   api_key: str | None = None, base_url: str | None = None) -> str:
+                   api_key: str | None = None, base_url: str | None = None,
+                   max_tokens: int | None = None) -> str:
         api_key = api_key if api_key is not None else self.cfg.api_key
         base_url = base_url if base_url is not None else self.cfg.base_url
+        max_tokens = max_tokens if max_tokens is not None else self.cfg.max_tokens
         url = f"{base_url}/chat/completions"
         payload = {
             "model": model,
             "messages": messages,
             "temperature": self.cfg.temperature,
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": max_tokens,
         }
         if response_format is not None:
             payload["response_format"] = response_format
@@ -365,6 +421,7 @@ class LLM:
                 headers={
                     "content-type": "application/json",
                     "authorization": f"Bearer {api_key}",
+                    "user-agent": "agentic-bank/1.0",
                 },
             )
             try:
@@ -372,6 +429,12 @@ class LLM:
                     return self._extract_groq_text(json.loads(r.read()), model)
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", "replace")
+                if e.code == 403 and _is_cloudflare_block(body):
+                    raise LLMProviderBlockedError(
+                        f"Groq request for model {model} was blocked by Cloudflare "
+                        f"(HTTP 403, error code 1010) before reaching the model — this is "
+                        f"provider/edge request-blocking, not an invalid API key. Common cause: "
+                        f"a missing or blocked User-Agent header. {_safe_excerpt(body)}") from None
                 if e.code in (401, 403):
                     raise LLMAuthError(
                         f"Groq auth error {e.code} for model {model}: {_safe_excerpt(body)}") from None
@@ -389,6 +452,35 @@ class LLM:
                     raise LLMTransientError(
                         f"Groq rate limit exhausted for model {model} after "
                         f"{self.cfg.max_retries} attempts: {_safe_excerpt(body)}") from None
+                if e.code == 413:
+                    # HTTP 413 (rate_limit_exceeded / request too large) is Groq
+                    # saying the request's tokens (prompt + requested max_tokens)
+                    # exceed the model's per-minute budget outright — not a
+                    # transient condition a retry/backoff will fix. Since
+                    # max_tokens is already a small, task-sized budget by the
+                    # time it reaches here, this means the PROMPT itself is the
+                    # problem — surface that distinctly instead of retrying.
+                    requested, limit = _parse_rate_limit_tokens(body)
+                    detail = (f"requested={requested} limit={limit} max_tokens_asked={max_tokens} "
+                              if requested is not None else f"max_tokens_asked={max_tokens} ")
+                    raise LLMPromptTooLargeError(
+                        f"Groq rejected model {model}'s request as too large for its per-minute "
+                        f"token budget ({detail}HTTP 413). The completion budget requested here is "
+                        f"already minimal, so the prompt/input itself is what needs to shrink (e.g. "
+                        f"a smaller batch or document slice) — retrying will not help. "
+                        f"{_safe_excerpt(body)}") from None
+                if e.code == 400 and _parse_groq_error_code(body) == "json_validate_failed":
+                    # Groq's JSON Object Mode itself failing to produce
+                    # syntactically valid JSON (documented Groq behavior) is
+                    # a model-output/generation-quality problem, not a
+                    # malformed request from us — fallback-eligible, same as
+                    # any other LLMValidationError. `failed_generation` in
+                    # the body may contain document/banking content, so only
+                    # a short excerpt is logged, and it's never parsed or
+                    # treated as application data.
+                    raise LLMValidationError(
+                        f"{model} failed to generate valid JSON (Groq HTTP 400, "
+                        f"error.code=json_validate_failed): {_safe_excerpt(body, 200)}") from None
                 if e.code in (500, 502, 503, 504):
                     if attempt < self.cfg.max_retries - 1:
                         time.sleep(delay + random.uniform(0, 0.5))
@@ -396,9 +488,10 @@ class LLM:
                         continue
                     raise LLMTransientError(
                         f"Groq server error {e.code} for model {model}: {_safe_excerpt(body)}") from None
-                # 400 / 404 / 422 etc.: the request itself is broken (bad
-                # model name, invalid payload) — a config/programming bug,
-                # never a reason to retry or fall back.
+                # Any other 400 (malformed payload, unsupported parameter,
+                # invalid schema, bad model id) / 404 / 422 etc.: the request
+                # itself is broken — a config/programming bug, never a
+                # reason to retry or fall back.
                 raise LLMRequestError(
                     f"Groq API error {e.code} for model {model}: {_safe_excerpt(body)}") from None
             except urllib.error.URLError:
@@ -435,7 +528,8 @@ class LLM:
                 {"type": "image_url", "image_url": {"url": f"data:{media};base64,{b64}"}},
             ]}]
             return self._chat_groq(self.cfg.vision_model, messages, response_format=None,
-                                    api_key=self.cfg.vision_api_key, base_url=self.cfg.vision_base_url)
+                                    api_key=self.cfg.vision_api_key, base_url=self.cfg.vision_base_url,
+                                    max_tokens=self.cfg.vision_max_tokens)
 
         def on_hit():
             print(f"VISION_CACHE_HIT file={image_path}")
@@ -506,7 +600,8 @@ class LLM:
             raise LLMError(f"Gemini returned empty output (finishReason={finish!r})")
         return text
 
-    def _json_call_gemini(self, system: str, user: str, schema: dict, name: str) -> dict:
+    def _json_call_gemini(self, system: str, user: str, schema: dict, name: str,
+                           max_tokens: int | None = None) -> dict:
         """Return a dict validated against `schema` by Gemini's structured output."""
         def run():
             self.calls += 1
@@ -515,7 +610,7 @@ class LLM:
                 "systemInstruction": {"parts": [{"text": system}]},
                 "generationConfig": {
                     "temperature": self.cfg.temperature,
-                    "maxOutputTokens": self.cfg.max_tokens,
+                    "maxOutputTokens": max_tokens if max_tokens is not None else self.cfg.max_tokens,
                     "responseMimeType": "application/json",
                     "responseSchema": _to_gemini_schema(schema),
                 },
@@ -550,7 +645,7 @@ class LLM:
                 ]}],
                 "generationConfig": {
                     "temperature": 0,
-                    "maxOutputTokens": self.cfg.max_tokens,
+                    "maxOutputTokens": self.cfg.vision_max_tokens,
                 },
             }
             data = self._post_gemini(payload, model=self.cfg.vision_model,
@@ -579,6 +674,39 @@ def _legacy_cache_key(cfg: LLMConfig, key: dict) -> dict | None:
         return {"p": key["prompt"], "img": key["image"],
                 "provider": cfg.provider, "m": cfg.model}
     return None
+
+
+def _parse_groq_error_code(body: str) -> str | None:
+    """The structured `error.code` out of a Groq JSON error body (e.g.
+    '"error": {"code": "json_validate_failed", ...}'), or None if the body
+    isn't JSON or has no such field. Only the code is read — the rest of
+    the error body (which may embed `failed_generation`, i.e. real document
+    content the model was working from) is never parsed as application
+    data, only ever logged as a short excerpt."""
+    try:
+        return (json.loads(body).get("error") or {}).get("code")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
+def _parse_rate_limit_tokens(body: str) -> tuple[int | None, int | None]:
+    """Best-effort (requested, limit) token counts out of a Groq 413/429
+    rate-limit error body, e.g. '...Requested 8121... Limit 6000...'.
+    Returns (None, None) if the body doesn't have that shape (still safe to
+    report the raw excerpt in that case)."""
+    import re
+    req_m = re.search(r"[Rr]equested\D{0,10}(\d+)", body)
+    lim_m = re.search(r"[Ll]imit\D{0,10}(\d+)", body)
+    return (int(req_m.group(1)) if req_m else None,
+            int(lim_m.group(1)) if lim_m else None)
+
+
+def _is_cloudflare_block(body: str) -> bool:
+    """True if a 403 body looks like a Cloudflare edge block (error code
+    1010, typically triggered by a missing/blocklisted User-Agent) rather
+    than Groq itself rejecting the credentials."""
+    low = body.lower()
+    return "cloudflare" in low and "1010" in low
 
 
 def _is_daily_quota_error(body: str) -> bool:

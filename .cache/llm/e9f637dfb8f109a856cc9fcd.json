@@ -1,0 +1,1 @@
+{"is_binding": true, "defers_to_report": null, "adjustments": [{"kind": "fx", "txn_id": null, "amount": null, "counterparty": null, "to_category": null, "currency": "EUR", "rate_to_usd": 1.16, "reason": "Foreign currency invoice settled in USD"}]}

@@ -121,7 +121,18 @@ class LLMConfig:
     vision_api_key: str = ""
     vision_base_url: str = ""
 
-    max_tokens: int = 8000
+    # Default completion budget for a json_call() that doesn't pass its own
+    # max_tokens override. Kept deliberately small: Groq's free-tier TPM
+    # limit (e.g. 6000 for llama-3.1-8b-instant) counts REQUESTED output
+    # tokens against the same per-minute budget as the prompt, so an
+    # oversized default (previously 8000) can 413 a tiny request all by
+    # itself before any real output is generated. Call sites with a
+    # genuinely larger schema (see extract.py) pass their own max_tokens.
+    max_tokens: int = int(os.environ.get("LLM_MAX_TOKENS", "2048"))
+    # Vision/OCR transcribes a full scanned page of text, not a small JSON
+    # object — kept as its own (unchanged, historical) default rather than
+    # inheriting the tightened `max_tokens` above.
+    vision_max_tokens: int = int(os.environ.get("LLM_VISION_MAX_TOKENS", "8000"))
     temperature: float = 0.0
     max_retries: int = 4
     # odd vote count for majority voting on the noisy transaction-classification stage

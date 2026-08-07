@@ -168,3 +168,16 @@ def find_evidence(ctx: Context, spec: dict, status: str, touched: set[str]) -> s
 
 def round2(x: float | None) -> float | None:
     return None if x is None else round(float(x) + 0.0, 2)
+
+
+def final_actual(value: float | None) -> float | None:
+    """The submission's reported `actual` (see module docstring: "always...
+    a positive number"): a genuine measurement, or null when there is
+    nothing meaningful to report. `metric()` already returns None for a
+    ratio whose denominator is zero; this folds a computed literal zero
+    into that same null representation too — the scoring rubric
+    (score.py's `cell_score`) already treats a zero actual identically to
+    a null one, so a bare 0.0 is never a distinct, validly-reported value
+    here, only ever a sign that nothing was there to measure."""
+    rounded = round2(value)
+    return None if rounded == 0 else rounded
