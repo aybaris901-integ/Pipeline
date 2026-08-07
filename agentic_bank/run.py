@@ -212,8 +212,14 @@ def main():
     if args.backend == "llm":
         from .llm import LLM
         cfg = LLMConfig()
+        cfg.verbose = args.verbose
         if not cfg.api_key:
-            raise SystemExit("GEMINI_API_KEY is not set")
+            env = "GROQ_API_KEY" if cfg.provider == "groq" else "GEMINI_API_KEY"
+            raise SystemExit(f"{env} is not set (LLM_PROVIDER={cfg.provider!r})")
+        # cfg.vision_api_key is checked lazily, only if a scanned page
+        # actually needs OCR — most runs never call vision() at all (see
+        # ingest.py), and requiring a second key up front would make the
+        # common case harder to run than before.
         llm = LLM(cfg, paths.llm_cache)
 
     texts = ingest_all(paths.documents, paths.text_cache, llm, args.vision_cache)
@@ -231,6 +237,8 @@ def main():
 
     template = json.load(open(paths.template, encoding="utf-8"))
     sub = Submission()
+    if llm is not None and "AB_MODEL" not in os.environ:
+        sub.model = cfg.model  # reflect the actually-configured model, not a stale default
     out = {"team": sub.team, "contact_email": sub.contact_email, "model": sub.model,
            "answers": {}}
 
